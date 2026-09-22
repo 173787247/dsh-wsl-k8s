@@ -1,0 +1,8 @@
+- insert:
+    - id: dsh-wsl-k8s
+      name: dsh-wsl-k8s
+      config:
+        enabled: true
+        timeoutMs: 30000
+        maxOutputChars: 40000
+        allowedContexts: []
