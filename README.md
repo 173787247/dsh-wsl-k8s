@@ -36,6 +36,15 @@ config:
 
 生产集群建议显式写 `allowedContexts`，并保证 kubeconfig 本身权限最小。
 
+## 兼容性
+
+| 字段 | 值 |
+|------|----|
+| **插件** | `dsh-wsl-k8s` **0.1.0** |
+| **最低 dsh** | ≥ **0.1.2**（Web UI 一次性 `?token=`，Windows 中继 `:3081`） |
+| **最新验证** | 以 [dsh-wsl-kit 兼容性](https://github.com/173787247/dsh-wsl-kit#compatibility-2026-09) 为准（当前 **`0.1.7-alpha.2`**）— 套件唯一真源 |
+| **套件档位** | 可选（默认不在 `install.sh` / `KIT_SET=daily`） |
+
 ## License
 
 MIT
