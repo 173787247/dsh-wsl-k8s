@@ -1,4 +1,4 @@
-import { assertReadonlyArgs, runKubectl, guardContext } from "./lib/kubectl.js";
+import { assertReadonlyArgs, runKubectl, guardContext, clampTail, parseContextsTable } from "./lib/kubectl.js";
 
 export const name = "dsh-wsl-k8s";
 export const inject = ["tools", "systemPrompt"];
@@ -10,18 +10,20 @@ export function apply(ctx, config = {}) {
   }
   const timeoutMs = positive(config.timeoutMs, 30_000);
   const maxOutputChars = positive(config.maxOutputChars, 40_000);
+  const maxTail = positive(config.maxTail, 500);
+  const defaultTail = positive(config.defaultTail, 100);
   const allowedContexts = Array.isArray(config.allowedContexts) ? config.allowedContexts.map(String) : [];
-  console.log(`[dsh-wsl-k8s] read-only kubectl allowedContexts=${allowedContexts.length || "any"}`);
+  console.log(`[dsh-wsl-k8s] read-only kubectl allowedContexts=${allowedContexts.length || "any"} maxTail=${maxTail}`);
 
   ctx.systemPrompt.section({
     name: "tool:k8s",
     order: 132,
-    text: "dsh-wsl-k8s exposes read-only kubectl (get/describe/logs/top/config view). It cannot apply/delete/exec. Prefer k8s_get with namespace. Set allowedContexts in config for production clusters.",
+    text: "dsh-wsl-k8s exposes read-only kubectl (contexts/get/describe/logs/top/config view). It cannot apply/delete/exec. Prefer k8s_contexts then k8s_get. k8s_logs tail is capped. Set allowedContexts in config for production clusters.",
   });
 
   ctx.tools.register({
     name: "k8s_status",
-    description: "kubectl version client/server if reachable; list current context.",
+    description: "kubectl client/server reachability, current context, and context count (read-only).",
     parameters: { type: "object", additionalProperties: false, properties: {} },
     output: { schema: { type: "object", additionalProperties: true }, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
     timeoutMs,
@@ -30,11 +32,25 @@ export function apply(ctx, config = {}) {
       try {
         const ver = await runKubectl(["version", "--client=true", "-o", "yaml"], { timeoutMs, maxOutputChars });
         const ctxOut = await runKubectl(["config", "current-context"], { timeoutMs, maxOutputChars });
+        const listOut = await runKubectl(["config", "get-contexts"], { timeoutMs, maxOutputChars });
+        const contexts = parseContextsTable(listOut.stdout);
+        let server = null;
+        try {
+          const srv = await runKubectl(["version", "-o", "yaml"], { timeoutMs: Math.min(timeoutMs, 15_000), maxOutputChars: 8_000 });
+          if (srv.code === 0) server = "reachable";
+          else server = { ok: false, stderr: (srv.stderr || "").slice(0, 200) };
+        } catch (e) {
+          server = { ok: false, error: e instanceof Error ? e.message : String(e) };
+        }
         return {
           ok: true,
-          client: ver.stdout.trim(),
+          client: ver.stdout.trim().slice(0, 4000),
           currentContext: ctxOut.code === 0 ? ctxOut.stdout.trim() : null,
+          contextCount: contexts.length,
           allowedContexts,
+          maxTail,
+          defaultTail,
+          server,
         };
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -42,6 +58,49 @@ export function apply(ctx, config = {}) {
     },
     presentCall: () => ({ card: "generic", title: "k8s status" }),
     presentResult: (_a, r) => ({ card: "generic", title: "k8s status", content: r.content }),
+  });
+
+  ctx.tools.register({
+    name: "k8s_contexts",
+    description: "List kubectl contexts (name/cluster/current). Honors allowedContexts filter when set.",
+    parameters: { type: "object", additionalProperties: false, properties: {} },
+    output: {
+      schema: { type: "object", additionalProperties: true },
+      render: (_a, v) => [
+        {
+          type: "text",
+          text:
+            v.ok === false
+              ? v.error
+              : (v.contexts || [])
+                  .map((c) => `${c.current ? "*" : " "} ${c.name}\tcluster=${c.cluster || "-"}\tns=${c.namespace || "-"}`)
+                  .join("\n") || "(none)",
+        },
+      ],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute() {
+      try {
+        assertReadonlyArgs(["config", "get-contexts"]);
+        const out = await runKubectl(["config", "get-contexts"], { timeoutMs, maxOutputChars });
+        if (out.code !== 0) throw new Error(out.stderr || `exit ${out.code}`);
+        let contexts = parseContextsTable(out.stdout);
+        if (allowedContexts.length) {
+          contexts = contexts.filter((c) => allowedContexts.includes(c.name));
+        }
+        return {
+          ok: true,
+          count: contexts.length,
+          current: contexts.find((c) => c.current)?.name || null,
+          contexts: contexts.slice(0, 100),
+        };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+    presentCall: () => ({ card: "generic", title: "k8s contexts" }),
+    presentResult: (_a, r) => ({ card: "generic", title: "k8s contexts", content: r.content }),
   });
 
   ctx.tools.register({
@@ -113,7 +172,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: "k8s_logs",
-    description: "kubectl logs POD (tail limited). Read-only.",
+    description: "kubectl logs POD (tail capped by config.maxTail, default 500). Read-only.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -122,7 +181,7 @@ export function apply(ctx, config = {}) {
         pod: { type: "string" },
         namespace: { type: "string" },
         container: { type: "string" },
-        tail: { type: "number" },
+        tail: { type: "number", description: `Lines from end (default ${defaultTail}, max ${maxTail})` },
         context: { type: "string" },
       },
     },
@@ -132,13 +191,13 @@ export function apply(ctx, config = {}) {
     async execute(args) {
       try {
         const context = guardContext(args.context, allowedContexts);
-        const tail = Math.min(500, Math.max(1, Number(args.tail) || 100));
+        const tail = clampTail(args.tail, { defaultTail, maxTail });
         const a = ["logs", String(args.pod), `--tail=${tail}`];
         if (args.namespace) a.push("-n", String(args.namespace));
         if (args.container) a.push("-c", String(args.container));
         assertReadonlyArgs(a);
         const out = await runKubectl(a, { timeoutMs, maxOutputChars, context });
-        return { ok: out.code === 0, ...out };
+        return { ok: out.code === 0, tail, ...out };
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
